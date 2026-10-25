@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 运行时产物（在 D:\bh-replay-lab\out-v2，理论上不在本目录，防御性排除）
+chat_session.json
+agent_memory.json
+desktop_config.json
+chat_export_*.md
+.wtest
+
+# 打包与构建
+build/
+build-v2/
+build-cw/
+dist/
+dist-v2/
+*.spec.bak
+
+# 编辑器/系统
+.vscode/
+.idea/
+Thumbs.db
+
+# 开发用脚本（不入库）
+_stress_test.py
