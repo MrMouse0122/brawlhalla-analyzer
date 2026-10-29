@@ -933,20 +933,23 @@ def render(ds, agg, me_sum, out_path):
         A("</div></div></div>")
 
     # ===== 最近对局 =====
-    A("<h2 id='sec-recent'><span class='no'>06</span>最近 25 场</h2>")
+    A("<h2 id='sec-recent'><span class='no'>06</span>全部对局（新 → 旧）</h2>")
     A("<div class='tablewrap'><table><thead><tr>"
-      "<th>文件</th><th>对手</th><th class='num'>时长</th><th>结果</th>"
+      "<th>时间</th><th>对手</th><th class='num'>时长</th><th>结果</th>"
+      "<th>文件</th>"
       "<th class='num'>对手真闪避/min</th><th class='num'>对手dash/min</th>"
       "<th class='num'>你真闪避/min</th><th class='num'>纯受压率</th>"
       "</tr></thead><tbody>")
-    for m in sorted(matches, key=lambda x: -x["mtime"])[:25]:
+    for m in sorted(matches, key=lambda x: -x["mtime"]):
         opp = m["opponent"] or "-"
         os_ = m["players"].get(opp, {}).get("sum", {}) if opp != "-" else {}
         ms_ = m["players"].get(me, {}).get("sum", {})
         res = "-" if not m["winner_name"] else (
             "<span class='win'>胜</span>" if m["winner_name"] == me else "<span class='lose'>负</span>")
-        A(f"<tr><td class='muted'>{esc(m['file'])}</td><td>{esc(opp)}</td>"
+        ts = datetime.datetime.fromtimestamp(m["mtime"]).strftime("%m-%d %H:%M")
+        A(f"<tr><td data-v='{int(m['mtime'])}'>{ts}</td><td>{esc(opp)}</td>"
           f"<td class='num' data-v='{m['minutes']}'>{m['minutes']:.1f}min</td><td>{res}</td>"
+          f"<td class='muted'>{esc(m['file'])}</td>"
           f"<td class='num' data-v='{os_.get('dodge_per_min', 0)}'>"
           f"{os_.get('dodge_per_min', '-')}</td>"
           f"<td class='num' data-v='{os_.get('dash_per_min', 0)}'>"

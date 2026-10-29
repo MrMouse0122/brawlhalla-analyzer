@@ -455,7 +455,8 @@ def match_detail(file_hint):
     if not seq_a or not seq_b:
         return {"error": "replay has an empty input stream"}
     out = {"file": os.path.basename(path), "duration_min": round(
-        max(seq_a[-1][0], seq_b[-1][0]) / 60000, 1)}
+        max(seq_a[-1][0], seq_b[-1][0]) / 60000, 1),
+        "duration_ms": int(max(seq_a[-1][0], seq_b[-1][0]))}
     for ent, other in ((a, b), (b, a)):
         seq = rep["inputs"].get(ent, [])
         dodges, dashes, attacks = [], [], []

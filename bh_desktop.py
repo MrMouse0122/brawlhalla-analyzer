@@ -14,6 +14,7 @@ import json
 import time
 import queue
 import ctypes
+import datetime
 import html as html_mod
 import threading
 import urllib.request
@@ -142,6 +143,23 @@ STR = {
         "help_title": "指标说明",
         "sample_small": "▸ 真闪避样本偏少（< 15 次），结论仅供参考。",
         "launch": "正在启动…",
+        "tab_matches": "对局",
+        "matches_title": "对局记录（新 → 旧）· 打完自动出现",
+        "m_time": "时间", "m_opp": "对手", "m_res": "结果", "m_dur": "时长",
+        "match_hint_none": "选择左侧对局查看本局明细",
+        "m_win": "胜", "m_loss": "负",
+        "md_map": "地图", "md_me": "我", "md_opp": "对手",
+        "kpi_deaths": "死亡次数",
+        "md_died": "被击杀",
+        "md_timeline": "本局时间轴（攻击密度 + 死亡时刻）",
+        "md_lg_me_atk": "▲ 你的攻击",
+        "md_lg_opp_atk": "▼ 对手攻击",
+        "md_lg_me_die": "✖ 你被击杀",
+        "md_lg_opp_die": "✖ 对手被击杀",
+        "md_lg_lead": "顶部条=领先方（绿=你 红=对手）",
+        "md_lg_scale": "左侧数字=每段攻击次数",
+        "md_tl_counts": "{me}攻击 {a} · {opp}攻击 {b}",
+        "md_no_detail": "本局明细解析失败（回放文件缺失或损坏）",
     },
     "en": {
         "app_title": "Brawlhalla Dodge Habit Analyzer",
@@ -217,6 +235,23 @@ STR = {
         "help_title": "Metric definitions",
         "sample_small": "▸ Sample too small (< 15 true dodges) — treat as hints only.",
         "launch": "Starting…",
+        "tab_matches": "Matches",
+        "matches_title": "Match history (new → old) · fresh games appear automatically",
+        "m_time": "Time", "m_opp": "Opponent", "m_res": "Result", "m_dur": "Len",
+        "match_hint_none": "Pick a match on the left",
+        "m_win": "W", "m_loss": "L",
+        "md_map": "Map", "md_me": "Me", "md_opp": "Opp",
+        "kpi_deaths": "Deaths",
+        "md_died": "died",
+        "md_timeline": "Match timeline (attack density + deaths)",
+        "md_lg_me_atk": "▲ your attacks",
+        "md_lg_opp_atk": "▼ opp attacks",
+        "md_lg_me_die": "✖ you died",
+        "md_lg_opp_die": "✖ opp died",
+        "md_lg_lead": "top strip = leader (green=you, red=opp)",
+        "md_lg_scale": "left numbers = attacks per bucket",
+        "md_tl_counts": "{me} atk {a} · {opp} atk {b}",
+        "md_no_detail": "Failed to parse this match (file missing or corrupt)",
     },
 }
 
@@ -327,6 +362,12 @@ class App:
         self._sel_name = None
         self._last_w = None
         self._asking = False
+        self._sel_match = None          # 对局页当前选中的 file
+        self._cur_match = None          # 供窗口 resize 时重绘节奏图
+        self.match_by_file = {}
+        self._open_ts = time.time()     # 本次启动时刻（用于标记“刚打完”的对局）
+        self._last_snap = None          # 回放目录指纹（自动刷新检测用）
+        self._new_matches_done = False  # last_match_count 每次启动只写回一次
 
         self._apply_window()
         self._build_style()
@@ -334,6 +375,7 @@ class App:
         self.root.bind("<Configure>", self._redraw_on_resize)
         self._start_load(initial=True)
         self.root.after(120, self._poll)
+        self.root.after(60000, self._auto_refresh_poll)
 
     # ---------------- 配置 ----------------
     def _cfg_path(self):
@@ -504,6 +546,12 @@ class App:
                 self.tree.selection_set(sel)
             elif self.tree.get_children():
                 self.tree.selection_set(self.tree.get_children()[0])
+        if self.ds:
+            self._fill_match_list()
+            if self._sel_match and self._sel_match in self.match_by_file:
+                self.mtree.selection_set(self._sel_match)
+            elif self.match_by_file:
+                self.mtree.selection_set(next(iter(self.match_by_file)))
 
     # ---------------- 样式 ----------------
     def _build_style(self):
@@ -635,8 +683,11 @@ class App:
 
         tab_profile = tk.Frame(content, bg=t["bg"])
         content.add(tab_profile, text=f"  {self.tr('tab_profile')}  ")
+        tab_matches = tk.Frame(content, bg=t["bg"])
+        content.add(tab_matches, text=f"  {self.tr('tab_matches')}  ")
         tab_chat = tk.Frame(content, bg=t["bg"])
         content.add(tab_chat, text=f"  {self.tr('tab_chat')}  ")
+        self._build_matches_tab(tab_matches)
         self._build_chat_tab(tab_chat)
 
         content.columnconfigure(0, weight=1)
@@ -841,7 +892,7 @@ class App:
     def _set_busy(self, busy):
         self.busy = busy
 
-    def _start_load(self, initial=False):
+    def _start_load(self, initial=False, quiet=False):
         if self.busy:
             return
         if not os.path.isdir(self.replay_dir):
@@ -849,8 +900,9 @@ class App:
             return
         self._set_busy(True)
         self.status_var.set(self.tr("loading" if initial else "refreshing"))
-        self.cache_var.set("")
-        self._show_placeholder()
+        if not quiet:               # 自动刷新走静默：不清空当前画面
+            self.cache_var.set("")
+            self._show_placeholder()
         self._save_config()
         threading.Thread(target=self._load_worker, daemon=True).start()
 
@@ -894,15 +946,35 @@ class App:
         self.status_var.set(self.tr("status_loaded", n=len(ds["matches"]),
                                     m=len(agg), me=me, w=wins, l=losses))
         self.cache_var.set(stats)
+        self._last_snap = self._dir_snapshot()
+        self._tl_cache = {}     # 单场明细缓存随数据集一并失效
+        self._tl = None
         self._rebuild_rows()
+        self._fill_match_list()
         self._chat_update_gate()   # 数据就绪后更新面板状态
-        self._new_matches_count()  # 写回 last_match_count（驱动聊天页“N 场新对局”提示）
+        if not self._new_matches_done:
+            self._new_matches_done = True
+            self._new_matches_count()  # 每次启动写回一次（驱动聊天页“N 场新对局”）
+        # 聊天服务已在跑时同步刷新其数据源（自动抓到新对局后 Agent 也能查到）
+        if "bh_api" in sys.modules:
+            try:
+                sys.modules["bh_api"].refresh()
+            except Exception:  # noqa: BLE001
+                pass
         # 已配置 AI 时自动启动聊天服务（浏览器访问 http://127.0.0.1:8903）
         if self.api_key and not self._server_alive():
             threading.Thread(target=self._open_webchat_quiet,
                              daemon=True).start()
-        if self.rows:
-            self.tree.selection_set(self.tree.get_children()[0])
+        # 恢复选中项（自动刷新不打断正在看的内容）
+        kids = self.tree.get_children()
+        if self._sel_name and self._sel_name in kids:
+            self.tree.selection_set(self._sel_name)
+        elif kids:
+            self.tree.selection_set(kids[0])
+        if self._sel_match and self._sel_match in self.match_by_file:
+            self.mtree.selection_set(self._sel_match)
+        elif self.match_by_file:
+            self.mtree.selection_set(next(iter(self.match_by_file)))
 
     def _open_webchat_quiet(self):
         """起服务但不弹浏览器。"""
@@ -1149,6 +1221,397 @@ class App:
                  font=("Consolas", 9), bg=t["card"], fg=t["muted"]).pack(
             pady=(int(8 * s), 0))
         self._chat_update_gate()
+
+    # ---------------- 对局页（按时间顺序的单场记录） ----------------
+    def _build_matches_tab(self, parent):
+        t = self.T()
+        s = self.s
+        self.match_by_file = {}
+        self._cur_match = None
+        parent.columnconfigure(0, weight=0)
+        parent.columnconfigure(1, weight=1)
+        parent.rowconfigure(0, weight=1)
+
+        # 左：时间序列表（新 → 旧）
+        left = tk.Frame(parent, bg=t["side"], highlightbackground=t["border"],
+                        highlightthickness=1)
+        left.grid(row=0, column=0, sticky="nsw")
+        left.rowconfigure(1, weight=1)
+        left.columnconfigure(0, weight=1)
+        tk.Label(left, text=self.tr("matches_title"), font=("Segoe UI", 10, "bold"),
+                 bg=t["side"], fg=t["muted"], anchor="w", padx=int(14 * s),
+                 pady=int(6 * s)).grid(row=0, column=0, sticky="ew")
+        mwrap = tk.Frame(left, bg=t["side"])
+        mwrap.grid(row=1, column=0, sticky="nsew")
+        mwrap.rowconfigure(0, weight=1)
+        mwrap.columnconfigure(0, weight=1)
+        self.mtree = ttk.Treeview(mwrap, columns=("t", "o", "r", "d"),
+                                  show="headings", selectmode="browse")
+        for col, key, w, mn, anchor, stretch in (
+                ("t", "m_time", int(104 * s), int(92 * s), "w", False),
+                ("o", "m_opp", int(128 * s), int(90 * s), "w", True),
+                ("r", "m_res", int(44 * s), int(40 * s), "center", False),
+                ("d", "m_dur", int(52 * s), int(46 * s), "e", False)):
+            self.mtree.heading(col, text=self.tr(key))
+            self.mtree.column(col, width=w, minwidth=mn, anchor=anchor,
+                              stretch=stretch)
+        self.mtree.grid(row=0, column=0, sticky="nsew")
+        msb = ttk.Scrollbar(mwrap, orient=tk.VERTICAL, command=self.mtree.yview)
+        msb.grid(row=0, column=1, sticky="ns")
+        self.mtree.configure(yscrollcommand=msb.set)
+        self.mtree.tag_configure("new", font=("Segoe UI", 10, "bold"))
+        self.mtree.bind("<<TreeviewSelect>>", lambda ev: self._on_match_select())
+
+        # 右：本局明细
+        right = tk.Frame(parent, bg=t["bg"])
+        right.grid(row=0, column=1, sticky="nsew", padx=(int(14 * s), 0))
+        right.columnconfigure(0, weight=1)
+        self.md_title_var = tk.StringVar(value=self.tr("match_hint_none"))
+        self.md_title_label = tk.Label(
+            right, textvariable=self.md_title_var, font=("Segoe UI", 15, "bold"),
+            bg=t["bg"], fg=t["text"], anchor="w")
+        self.md_title_label.grid(row=0, column=0, sticky="ew")
+        self.md_meta_var = tk.StringVar(value=" ")
+        tk.Label(right, textvariable=self.md_meta_var, font=("Segoe UI", 9),
+                 bg=t["bg"], fg=t["muted"], anchor="w").grid(
+            row=1, column=0, sticky="ew", pady=(2, int(8 * s)))
+
+        self.md_kpi_frame = tk.Frame(right, bg=t["bg"])
+        self.md_kpi_frame.grid(row=2, column=0, sticky="ew")
+
+        tk.Label(right, text=self.tr("md_timeline"), font=("Segoe UI", 10, "bold"),
+                 bg=t["bg"], fg=t["text"], anchor="w").grid(
+            row=3, column=0, sticky="ew", pady=(int(12 * s), 2))
+        self.md_timeline = tk.Canvas(right, height=int(200 * s), bg=t["bg"],
+                                     highlightthickness=0)
+        self.md_timeline.grid(row=4, column=0, sticky="ew")
+        self.md_timeline.bind("<Configure>", lambda ev: self._redraw_timeline())
+        self.md_timeline.bind("<Motion>", self._on_timeline_motion)
+        self.md_timeline.bind("<Leave>",
+                              lambda ev: self.md_hover_var.set(""))
+        self.md_hover_var = tk.StringVar(value="")
+        self.md_hover_label = tk.Label(right, textvariable=self.md_hover_var,
+                                       font=("Consolas", 9), bg=t["bg"],
+                                       fg=t["muted"], anchor="w")
+        self.md_hover_label.grid(row=5, column=0, sticky="ew", pady=(2, 0))
+        self._tl = None
+        self._tl_cache = {}
+
+    def _fill_match_list(self):
+        self.match_by_file = {}
+        if not self.ds:
+            return
+        self.mtree.delete(*self.mtree.get_children())
+        ms = [m for m in self.ds.get("matches", []) if m.get("me")]
+        ms.sort(key=lambda m: -m["mtime"])
+        for m in ms:
+            f = m["file"]
+            self.match_by_file[f] = m
+            if m.get("winner_name") == m.get("me"):
+                res = self.tr("m_win")
+            elif m.get("opponent") and m.get("winner_name") == m.get("opponent"):
+                res = self.tr("m_loss")
+            else:
+                res = "—"
+            ts = datetime.datetime.fromtimestamp(m["mtime"]).strftime("%m-%d %H:%M")
+            # 本次启动后打完的对局加粗标记（一眼看到“刚打完的”）
+            tags = ("new",) if m["mtime"] >= self._open_ts else ()
+            self.mtree.insert("", tk.END, iid=f,
+                              values=(ts, m.get("opponent") or "-", res,
+                                      f"{m['minutes']:.1f}"),
+                              tags=tags)
+
+    def _on_match_select(self, *_):
+        sel = self.mtree.selection()
+        if not sel:
+            return
+        m = self.match_by_file.get(sel[0])
+        if not m:
+            return
+        self._sel_match = sel[0]
+        try:
+            self._render_match_detail(m)
+        except Exception:  # noqa: BLE001
+            import traceback
+            traceback.print_exc()   # 单场明细失败不影响整页
+
+    @staticmethod
+    def _fmt_mmss(ms):
+        sec = int(ms // 1000)
+        return f"{sec // 60:02d}:{sec % 60:02d}"
+
+    def _render_match_detail(self, m):
+        t = self.T()
+        s = self.s
+        me, opp = m.get("me"), m.get("opponent")
+        players = m.get("players") or {}
+        my, op = players.get(me), players.get(opp)
+        if m.get("winner_name") == me:
+            res_txt, res_col = self.tr("m_win"), t["win"]
+        elif opp and m.get("winner_name") == opp:
+            res_txt, res_col = self.tr("m_loss"), t["bad"]
+        else:
+            res_txt, res_col = "—", t["muted"]
+        dt = datetime.datetime.fromtimestamp(m["mtime"]).strftime("%Y-%m-%d %H:%M")
+        self.md_title_var.set(f"{opp or '-'}  {res_txt}")
+        self.md_title_label.configure(fg=res_col)
+        hero_bits = []
+        if my:
+            hero_bits.append(f"{self.tr('md_me')} {legend_name(my.get('hero'))}")
+        if op:
+            hero_bits.append(f"{self.tr('md_opp')} {legend_name(op.get('hero'))}")
+        self.md_meta_var.set(
+            f"{dt} · {m['minutes']:.1f}min · "
+            f"{self.tr('md_map')} {m.get('level_id', '-')} · " + " · ".join(hero_bits))
+
+        # KPI 对比（我 vs 对手，本局口径）
+        for wdg in self.md_kpi_frame.winfo_children():
+            wdg.destroy()
+        my_s = (my or {}).get("sum") or {}
+        op_s = (op or {}).get("sum") or {}
+
+        def val(v, suffix=""):
+            return "–" if v is None else f"{v:g}{suffix}"
+
+        def med(d):
+            v = d.get("reaction_median_ms")
+            return f"{v}ms" if v is not None else "–"
+
+        rows = [
+            (self.tr("kpi_dodge_per_min"),
+             val(my_s.get("dodge_per_min")), val(op_s.get("dodge_per_min"))),
+            (self.tr("kpi_dash_per_min"),
+             val(my_s.get("dash_per_min")), val(op_s.get("dash_per_min"))),
+            (self.tr("kpi_attacks_per_min"),
+             val(my_s.get("attacks_per_min")), val(op_s.get("attacks_per_min"))),
+            (self.tr("kpi_reactive_rate"),
+             val(my_s.get("reactive_rate"), "%"), val(op_s.get("reactive_rate"), "%")),
+            (self.tr("kpi_reaction"), med(my_s), med(op_s)),
+            (self.tr("kpi_deaths"),
+             str(my.get("deaths")) if my else "–",
+             str(op.get("deaths")) if op else "–"),
+        ]
+        for c, txt in enumerate(("", self.tr("md_me"), self.tr("md_opp"))):
+            tk.Label(self.md_kpi_frame, text=txt, font=("Segoe UI", 9, "bold"),
+                     bg=t["bg"], fg=t["muted"],
+                     anchor=("w" if c == 0 else "e")).grid(
+                row=0, column=c,
+                padx=(0, int(26 * s) if c else 0), sticky="ew")
+        for r, (label, mv, ov) in enumerate(rows, start=1):
+            tk.Label(self.md_kpi_frame, text=label, font=("Segoe UI", 9),
+                     bg=t["bg"], fg=t["text"], anchor="w").grid(
+                row=r, column=0, sticky="ew")
+            for c, v in ((1, mv), (2, ov)):
+                tk.Label(self.md_kpi_frame, text=v, font=("Consolas", 10),
+                         bg=t["bg"], fg=t["text"], anchor="e").grid(
+                    row=r, column=c,
+                    padx=(int(26 * s), 0) if c == 1 else (0, 0), sticky="e")
+
+        # 本局时间轴（单文件解析，稍后异步画）
+        self._cur_match = m
+        self.root.after(10, self._redraw_timeline)
+
+    def _redraw_timeline(self):
+        if self._cur_match:
+            self._draw_match_timeline(self._cur_match)
+
+    def _match_detail_cached(self, m):
+        key = (self.replay_dir, m["file"])
+        if key not in self._tl_cache:
+            try:
+                import bh_api
+                self._tl_cache[key] = bh_api.match_detail(m["file"])
+            except Exception:  # noqa: BLE001
+                self._tl_cache[key] = {"error": "parse failed"}
+        return self._tl_cache[key]
+
+    def _draw_match_timeline(self, m):
+        """整局时间轴：横轴=比赛时间。上/下条=双方攻击密度（自适应桶宽），
+        ✖=精确死亡时刻（带虚线定位），顶部彩条=当时谁在领先。悬停看精确事件。"""
+        cv = self.md_timeline
+        t = self.T()
+        s = self.s
+        cv.delete("all")
+        try:
+            cv.update_idletasks()
+        except tk.TclError:
+            return
+        me, opp = m.get("me"), m.get("opponent")
+        det = self._match_detail_cached(m)
+        if "error" in det or me not in det or opp not in det:
+            cv.create_text(int(8 * s), int(10 * s), anchor="nw",
+                           text=self.tr("md_no_detail"),
+                           font=("Segoe UI", 9), fill=t["muted"])
+            self._tl = None
+            return
+        dur = max(int(det.get("duration_ms") or 0), 1000)
+        my_d = [x for x in (det[me].get("death_times_ms") or []) if 0 <= x <= dur]
+        op_d = [x for x in (det[opp].get("death_times_ms") or []) if 0 <= x <= dur]
+        my_a = [a["t_ms"] for a in (det[me].get("attacks") or [])]
+        op_a = [a["t_ms"] for a in (det[opp].get("attacks") or [])]
+        W = max(int(cv.winfo_width()), int(380 * s))
+        H = int(cv.cget("height"))
+
+        # 图例（带色文字，等宽排布）
+        import tkinter.font as tkfont
+        f = tkfont.Font(root=self.root, font=("Segoe UI", 8))
+        lx = int(6 * s)
+        for txt, col in ((self.tr("md_lg_me_atk"), t["accent"]),
+                         (self.tr("md_lg_opp_atk"), t["blue"]),
+                         (self.tr("md_lg_me_die"), t["bad"]),
+                         (self.tr("md_lg_opp_die"), t["win"]),
+                         (self.tr("md_lg_lead"), t["muted"]),
+                         (self.tr("md_lg_scale"), t["muted"])):
+            cv.create_text(lx, int(9 * s), anchor="w", text=txt,
+                           font=("Segoe UI", 8), fill=col)
+            lx += f.measure(txt) + int(14 * s)
+
+        # 布局：图例 / 领先条 / 图表 / 时间刻度；左侧留白放数值刻度
+        pad_l = int(34 * s)
+        x0 = pad_l
+        plot_w = max(W - x0, int(300 * s))
+        strip_y = int(20 * s)
+        strip_h = int(5 * s)
+        chart_t = strip_y + strip_h + int(8 * s)
+        chart_b = H - int(20 * s)
+        mid = (chart_t + chart_b) // 2
+        half = (chart_b - chart_t) // 2
+        bar_max = max(half - int(16 * s), 8)
+
+        # 时间刻度 + 竖网格
+        step = next((tv * 1000 for tv in (15, 30, 60, 120, 300, 600)
+                     if tv * 1000 >= dur / 6), 600000)
+        tt = step
+        while tt < dur:
+            x = x0 + tt / dur * plot_w
+            cv.create_line(x, chart_t, x, chart_b, fill=t["border"])
+            cv.create_text(x, H - int(9 * s), text=self._fmt_mmss(tt),
+                           font=("Consolas", 8), fill=t["muted"])
+            tt += step
+
+        # 攻击密度条（约 8 秒/桶，自适应桶数）
+        nb = max(12, min(72, int(dur // 8000)))
+        bw = plot_w / nb
+
+        def counts(ats):
+            c = [0] * nb
+            for ts in ats:
+                if 0 <= ts < dur:
+                    c[min(int(ts / dur * nb), nb - 1)] += 1
+            return c
+
+        cm, co = counts(my_a), counts(op_a)
+        mx = max(max(cm), max(co), 1)
+        for i in range(nb):
+            x = x0 + i * bw
+            if cm[i]:
+                h1 = bar_max * cm[i] / mx
+                cv.create_rectangle(x + 1, mid - h1, x + bw - 1, mid,
+                                    fill=t["accent"], width=0)
+            if co[i]:
+                h2 = bar_max * co[i] / mx
+                cv.create_rectangle(x + 1, mid, x + bw - 1, mid + h2,
+                                    fill=t["blue"], width=0)
+        cv.create_line(x0, mid, W, mid, fill=t["border"])
+
+        # 数值刻度：满格与半格横网格线 + 左侧数值（上下对称同刻度）
+        for frac in (1.0, 0.5):
+            for sgn in (-1, 1):
+                y = mid + sgn * bar_max * frac
+                cv.create_line(x0, y, W, y, fill=t["border"])
+            v = mx * frac
+            lab = f"{v:g}"
+            cv.create_text(int(4 * s), mid - bar_max * frac, anchor="w",
+                           text=lab, font=("Consolas", 8), fill=t["muted"])
+            cv.create_text(int(4 * s), mid + bar_max * frac, anchor="w",
+                           text=lab, font=("Consolas", 8), fill=t["muted"])
+
+        # 死亡标记（精确时刻）+ 虚线定位
+        deaths_xy = []
+        for ts in op_d:
+            x = x0 + ts / dur * plot_w
+            cv.create_line(x, chart_t, x, chart_b, fill=t["border"], dash=(2, 3))
+            cv.create_text(x, mid - bar_max - int(8 * s), text="✖",
+                           font=("Segoe UI Symbol", 10), fill=t["win"])
+            deaths_xy.append((x, ts, opp))
+        for ts in my_d:
+            x = x0 + ts / dur * plot_w
+            cv.create_line(x, chart_t, x, chart_b, fill=t["border"], dash=(2, 3))
+            cv.create_text(x, mid + bar_max + int(8 * s), text="✖",
+                           font=("Segoe UI Symbol", 10), fill=t["bad"])
+            deaths_xy.append((x, ts, me))
+
+        # 领先条：每一次死亡推进一次（领先 = 对手已死次数更多）
+        lead = 0
+        last_t = 0
+        for ts, delta in sorted([(x, 1) for x in op_d]
+                                + [(x, -1) for x in my_d]) + [(dur, 0)]:
+            if ts > last_t:
+                color = (t["muted"] if lead == 0
+                         else (t["win"] if lead > 0 else t["bad"]))
+                cv.create_rectangle(x0 + last_t / dur * plot_w, strip_y,
+                                    x0 + ts / dur * plot_w, strip_y + strip_h,
+                                    fill=color, width=0)
+                last_t = ts
+            lead += delta
+        cv.create_line(x0, strip_y + strip_h, W, strip_y + strip_h,
+                       fill=t["border"])
+        self._tl = {"x0": x0, "plot_w": plot_w, "nb": nb, "cm": cm, "co": co,
+                    "dur": dur, "deaths": deaths_xy, "me": me}
+
+    def _on_timeline_motion(self, ev):
+        g = getattr(self, "_tl", None)
+        if not g:
+            return
+        t = self.T()
+        thr = int(7 * self.s)
+        hit = None
+        for (dx, ts, who) in g["deaths"]:
+            if abs(ev.x - dx) <= thr and (hit is None or abs(ev.x - dx) < abs(ev.x - hit[0])):
+                hit = (dx, ts, who)
+        # 光标所在桶的双方攻击次数
+        rel = max(0, min(ev.x - g["x0"], g["plot_w"] - 0.001))
+        bi = int(rel / g["plot_w"] * g["nb"]) if g["plot_w"] else 0
+        counts_txt = self.tr("md_tl_counts", me=self.tr("md_me"),
+                             a=g["cm"][bi], opp=self.tr("md_opp"),
+                             b=g["co"][bi])
+        if hit:
+            self.md_hover_var.set(
+                f"{self._fmt_mmss(hit[1])} · {hit[2]} {self.tr('md_died')}"
+                f" · {counts_txt}")
+            self.md_hover_label.configure(
+                fg=t["bad"] if hit[2] == g["me"] else t["win"])
+        else:
+            t_ms = int(rel / g["plot_w"] * g["dur"])
+            self.md_hover_var.set(f"{self._fmt_mmss(t_ms)} · {counts_txt}")
+            self.md_hover_label.configure(fg=t["muted"])
+
+    # ---------------- 自动发现新对局 ----------------
+    def _dir_snapshot(self):
+        """回放目录指纹（文件名+mtime+size 摘要），用于检测打完的新对局。"""
+        try:
+            items = []
+            for name in os.listdir(self.replay_dir):
+                if name.lower().endswith(".replay"):
+                    try:
+                        st = os.stat(os.path.join(self.replay_dir, name))
+                        items.append((name, st.st_mtime_ns, st.st_size))
+                    except OSError:
+                        pass
+            return tuple(sorted(items))
+        except OSError:
+            return None
+
+    def _auto_refresh_poll(self):
+        """每 60s 检查一次回放目录：有新对局/变更就静默增量刷新（打完就能看）。
+        走增量缓存，通常只有新文件会被解析（每个约 0.1-0.2s）。"""
+        try:
+            if (not self.busy and self._last_snap is not None
+                    and self._dir_snapshot() != self._last_snap):
+                self._start_load(quiet=True)
+        except Exception:  # noqa: BLE001
+            pass
+        self.root.after(60000, self._auto_refresh_poll)
 
     def _server_alive(self, port=8903):
         import socket
